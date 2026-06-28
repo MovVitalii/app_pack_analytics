@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pack Operations Center · H&M</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-logo">
+    <div class="header-logo-badge">H&amp;M</div>
+    Pack Operations Center
+  </div>
+  <div class="header-file" id="header-filename">Nie załadowano pliku</div>
+  <div class="header-actions">
+    <button class="btn btn-ghost btn-sm" onclick="triggerUpload()">📂 Wczytaj Excel</button>
+    <button class="btn btn-ghost btn-sm" onclick="exportOpsData()">💾 Eksport Workspace JSON</button>
+    <button class="btn btn-ghost btn-sm" onclick="triggerOpsImport()">📥 Import Workspace JSON</button>
+    <button class="btn btn-ghost btn-sm" onclick="window.print()">🖨️ Print / PDF</button>
+  </div>
+</div>
+
+<!-- UPLOAD SCREEN -->
+<div id="upload-screen">
+  <div class="upload-card">
+    <div style="font-size:13px;font-weight:600;color:var(--amber);letter-spacing:.05em;text-transform:uppercase;margin-bottom:8px;">Outbound Pack Online</div>
+    <div style="font-size:22px;font-weight:700;color:var(--ink);margin-bottom:8px;">Frontend-only Pack Operations Toolkit</div>
+    <div style="font-size:13px;color:var(--ink-dim);">Wczytaj raport Excel albo kontynuuj pracę z lokalnym Workspace — bez backendu i bez serwera</div>
+    <div class="drop-zone" id="drop-zone" onclick="triggerUpload()">
+      <div class="drop-icon">📊</div>
+      <div class="drop-title">Przeciągnij plik albo kliknij, aby wybrać</div>
+      <div class="drop-sub">.xlsx · .xls · .xlsm · .csv · .tsv · .ods · .xml</div>
+    </div>
+    <div class="upload-note">⚡ Dane są przetwarzane lokalnie w przeglądarce — nic nie jest wysyłane na serwer</div>
+    <div style="font-size:11px;color:var(--ink-dim);margin-top:18px;">Stworzony przez Vitalii Movchan i Yaryna Yakymchuk</div>
+    <input type="file" id="file-input" accept=".xlsx,.xls,.xlsm,.csv,.tsv,.ods,.xml,.prn">
+    <input type="file" id="ops-import-input" accept=".json" style="display:none" onchange="importOpsData(event)">
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="app">
+  <div class="main">
+
+    <!-- INFO BAR -->
+    <div class="info-bar">
+      <div class="info-chip">📄 <strong id="ib-name">—</strong></div>
+      <div class="info-chip">Wiersze: <strong id="ib-rows">—</strong></div>
+      <div class="info-chip">Kolumny: <strong id="ib-cols">—</strong></div>
+      <div class="info-chip" id="ib-sheet-wrap" style="display:none;">
+        Arkusz:
+        <select class="sheet-select" id="sheet-select" onchange="loadSheet(this.value)"></select>
+      </div>
+      <div class="info-chip" id="shift-wrap" style="display:none;">
+        Zmiana:
+        <select class="sheet-select" id="shift-select" onchange="setShiftFilter(this.value)">
+          <option value="all">Wszystkie</option>
+          <option value="0">Zmiana 1 (06:00–18:00)</option>
+          <option value="1">Zmiana 2 (18:00–06:00)</option>
+        </select>
+      </div>
+      <div class="info-chip" id="period-wrap" style="display:none;">
+        Okres:
+        <select class="sheet-select" id="period-select" onchange="setPeriodFilter(this.value)">
+          <option value="all">Cały plik</option>
+          <option value="7">Ostatnie 7 dni</option>
+          <option value="30">Ostatnie 30 dni</option>
+          <option value="90">Ostatnie 90 dni</option>
+        </select>
+      </div>
+      <div id="shift-empty-banner" style="display:none;background:rgba(217,96,92,.12);color:var(--red);border:1px solid rgba(217,96,92,.35);border-radius:6px;padding:4px 12px;font-size:12px;">
+        ⚠️ Plik nie zawiera wierszy dla wybranej zmiany
+      </div>
+      <div style="margin-left:auto;display:flex;gap:8px;">
+        <button class="btn btn-primary btn-sm" onclick="triggerUpload()">📂 Nowy raport Excel</button>
+      </div>
+    </div>
+
+    <!-- TABS -->
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('explore',this)">🧭 Analiza Excel</div>
+      <div class="tab" onclick="switchTab('incidents',this)">🚨 Centrum incydentów</div>
+      <div class="tab" onclick="switchTab('knowledge',this)">📚 Baza wiedzy</div>
+      <div class="tab" onclick="switchTab('performance',this)">🎯 Wyniki AU</div>
+      <div class="tab" onclick="switchTab('table',this)">📋 Tabela</div>
+    </div>
+
+    <!-- TAB: EXPLORE — Excel-style pivot table builder -->
+    <div id="tab-explore" class="tab-content active">
+
+      <!-- EXCEL-STYLE PIVOT BUILDER -->
+      <div id="pivot-builder" style="display:grid;grid-template-columns:240px 1fr;gap:16px;align-items:start;">
+
+        <!-- FIELD LIST -->
+        <div class="chart-builder" style="margin-bottom:0;">
+          <div class="builder-title" style="margin-bottom:10px;">📋 Lista pól</div>
+          <div style="font-size:10.5px;color:var(--ink-dim);margin-bottom:10px;">Przeciągnij pole do obszaru po prawej (Filtry / Podział kolorami / Oś X / Oś Y)</div>
+          <div id="pivot-field-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+        </div>
+
+        <!-- RIGHT SIDE: drop zones + result -->
+        <div>
+          <div class="chart-builder" style="margin-bottom:16px;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <div>
+                <div class="form-label" style="margin-bottom:6px;">🔎 Filtry</div>
+                <div class="pivot-dropzone" id="zone-filters" data-zone="filters" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="onFieldDrop(event,'filters')"></div>
+                <div style="font-size:10px;color:var(--ink-dim);margin-top:3px;">Ogranicza dane — nic nie widać na wykresie</div>
+              </div>
+              <div>
+                <div class="form-label" style="margin-bottom:6px;">🎨 Podział kolorami (opcjonalnie)</div>
+                <div class="pivot-dropzone" id="zone-columns" data-zone="columns" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="onFieldDrop(event,'columns')"></div>
+                <div style="font-size:10px;color:var(--ink-dim);margin-top:3px;">Dzieli każdy słupek na kolory (legenda) — NIE jest osią</div>
+              </div>
+              <div>
+                <div class="form-label" style="margin-bottom:6px;">↔️ Oś X</div>
+                <div class="pivot-dropzone" id="zone-rows" data-zone="rows" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="onFieldDrop(event,'rows')"></div>
+                <div style="font-size:10px;color:var(--ink-dim);margin-top:3px;">To co porównujesz — pojawi się jako słupki (np. ID pracownika)</div>
+              </div>
+              <div>
+                <div class="form-label" style="margin-bottom:6px;">↕️ Oś Y</div>
+                <div class="pivot-dropzone" id="zone-values" data-zone="values" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="onFieldDrop(event,'values')"></div>
+                <div style="font-size:10px;color:var(--ink-dim);margin-top:3px;">Liczba do zmierzenia — wysokość słupka (np. Takt, Suma)</div>
+              </div>
+            </div>
+            <div style="margin-top:14px;display:flex;gap:8px;align-items:center;">
+              <button class="btn btn-ghost btn-sm" onclick="clearPivotZones()">🗑️ Wyczyść wszystko</button>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-dim);margin-left:auto;">
+                <input type="checkbox" id="pivot-show-chart" checked onchange="renderExcelPivot()" style="width:auto;"> Pokaż wykres
+              </label>
+            </div>
+          </div>
+
+          <div class="chart-builder" id="pivot-result-card">
+            <div class="builder-title">📐 Wynik</div>
+            <div id="pivot-chart-wrap" style="position:relative;width:100%;height:260px;margin-bottom:16px;display:none;"><canvas id="pivot-chart"></canvas></div>
+            <div id="pivot-table-wrap" style="overflow:auto;max-height:520px;border:1px solid var(--line);border-radius:8px;">
+              <div class="empty">Przeciągnij pola po lewej do obszarów powyżej, aby zbudować tabelę.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Filter value-picker popup (Excel-style checklist) -->
+      <div id="pivot-filter-popup" style="display:none;position:fixed;z-index:500;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.5);padding:10px;max-height:320px;overflow:auto;min-width:200px;"></div>
+
+    </div>
+
+    <!-- TAB: TABLE -->
+    <div id="tab-table" class="tab-content">
+      <div class="table-controls">
+        <input type="text" class="search-input" id="search-input" placeholder="🔍 Szukaj w całej tabeli..." oninput="filterTable()">
+        <select id="filter-col" onchange="filterTable()">
+          <option value="">Filtruj według kolumny — wszystkie</option>
+        </select>
+        <select id="filter-val" onchange="filterTable()">
+          <option value="">Wszystkie wartości</option>
+        </select>
+        <button class="btn btn-primary btn-sm" onclick="exportFiltered()">⬇️ Eksportuj filtrowane</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead id="table-head"></thead>
+          <tbody id="table-body"></tbody>
+        </table>
+        <div class="pagination">
+          <span id="page-info">—</span>
+          <div class="page-btns" id="page-btns"></div>
+        </div>
+      </div>
+    </div>
+
+
+
+    <!-- TAB: INCIDENT CENTER -->
+    <div id="tab-incidents" class="tab-content">
+      <div id="ops-kpi-grid" class="kpi-grid ops-kpi-grid"></div>
+      <div class="ops-grid-2">
+        <div class="chart-builder">
+          <div class="builder-title">🚨 Dodaj incydent / zgłoszenie</div>
+          <div class="ops-form-grid">
+            <input id="inc-area" type="text" placeholder="Obszar / stacja, np. Pack 03">
+            <input id="inc-device" type="text" placeholder="Urządzenie, np. drukarka / skaner">
+            <select id="inc-priority"><option>Niski</option><option selected>Średni</option><option>Wysoki</option><option>Krytyczny</option></select>
+            <select id="inc-status"><option selected>Otwarte</option><option>W trakcie</option><option>Eskalowane</option><option>Rozwiązane</option><option>Zamknięte</option></select>
+            <input id="inc-category" type="text" placeholder="Kategoria, np. błąd etykiety">
+            <input id="inc-owner" type="text" placeholder="Odpowiedzialny / AU">
+            <input id="inc-response" type="number" placeholder="Czas reakcji (min)">
+            <input id="inc-resolution" type="number" placeholder="Czas rozwiązania (min)">
+            <input id="inc-root" type="text" placeholder="Przyczyna źródłowa">
+            <input id="inc-solution" type="text" placeholder="Rozwiązanie / szybka reakcja">
+          </div>
+          <textarea id="inc-description" class="ops-textarea" placeholder="Opis / notatka komunikacyjna"></textarea>
+          <div class="ops-actions">
+            <button class="btn btn-primary btn-sm" onclick="addIncident()">＋ Zapisz incydent</button>
+            <button class="btn btn-ghost btn-sm" onclick="clearOpsDataConfirm()">🧹 Wyczyść lokalny Workspace</button>
+          </div>
+        </div>
+        <div class="chart-builder">
+          <div class="builder-title">♻️ Powtarzalne problemy z pliku + lokalnych incydentów</div>
+          <div id="recurring-issues-list" class="ops-list"></div>
+        </div>
+      </div>
+      <div class="chart-builder">
+        <div class="builder-title">📋 Rejestr incydentów</div>
+        <div id="incident-table-wrap" class="ops-table-wrap"></div>
+      </div>
+    </div>
+
+    <!-- TAB: KNOWLEDGE BASE -->
+    <div id="tab-knowledge" class="tab-content">
+      <div class="ops-grid-2">
+        <div class="chart-builder">
+          <div class="builder-title">📚 Nowy artykuł / instrukcja / checklista</div>
+          <div class="ops-form-grid">
+            <input id="kb-title" type="text" placeholder="Tytuł, np. Drukarka offline - szybka reakcja">
+            <input id="kb-area" type="text" placeholder="Obszar / urządzenie">
+            <select id="kb-type"><option>Instrukcja</option><option>Checklista</option><option>Szybka reakcja</option><option>Rozwiązanie</option><option>Materiał szkoleniowy</option></select>
+            <input id="kb-tags" type="text" placeholder="Tagi: drukarka, etykieta, Fortna">
+          </div>
+          <textarea id="kb-problem" class="ops-textarea" placeholder="Problem / objawy"></textarea>
+          <textarea id="kb-solution" class="ops-textarea" placeholder="Rozwiązanie / kroki / weryfikacja"></textarea>
+          <div class="ops-actions"><button class="btn btn-primary btn-sm" onclick="addKnowledgeArticle()">＋ Zapisz artykuł</button></div>
+        </div>
+        <div class="chart-builder">
+          <div class="builder-title">🔎 Szukaj w bazie wiedzy</div>
+          <input id="kb-search" type="text" class="search-input" placeholder="Szukaj artykułu, rozwiązania, tagów..." oninput="renderKnowledgeBase()">
+          <div id="kb-progress" class="ops-progress-box"></div>
+        </div>
+      </div>
+      <div id="kb-list" class="ops-card-list"></div>
+    </div>
+
+    <!-- TAB: AU PERFORMANCE -->
+    <div id="tab-performance" class="tab-content">
+      <div class="chart-builder">
+        <div class="builder-title">🎯 Goal Tracker — dowody realizacji celów</div>
+        <div id="goal-tracker" class="ops-goal-grid"></div>
+      </div>
+      <div class="ops-grid-2">
+        <div class="chart-builder">
+          <div class="builder-title">✅ Gotowość operacyjna</div>
+          <div id="readiness-box"></div>
+        </div>
+        <div class="chart-builder">
+          <div class="builder-title">🧾 Tekst do rozmowy z przełożonym</div>
+          <div id="manager-summary" class="ops-summary"></div>
+        </div>
+      </div>
+    </div>
+
+    <div style="text-align:center;padding:18px 0 6px;font-size:11px;color:var(--ink-dim);">
+      Stworzony przez Vitalii Movchan i Yaryna Yakymchuk
+    </div>
+  </div>
+</div>
+
+<script src="script.js"></script>
+
+</body>
+</html>
