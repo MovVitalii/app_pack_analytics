@@ -122,11 +122,12 @@ function readFile(file) {
         workbook = XLSX.read(e.target.result, { type: 'array', cellDates: true });
         currentFileName = file.name;
         sheetNames = workbook.SheetNames;
+        window.__sheetProfiles = sheetNames.map(n => analyzeWorksheetProfile(workbook.Sheets[n], n));
         document.getElementById('ib-name').textContent = file.name;
         document.getElementById('header-filename').textContent = file.name;
         if(sheetNames.length > 1) {
           const sel = document.getElementById('sheet-select');
-          sel.innerHTML = sheetNames.map((n,i) => `<option value="${i}">${n}</option>`).join('');
+          sel.innerHTML = sheetNames.map((n,i) => `<option value="${i}">${sheetOptionLabel(n, window.__sheetProfiles[i])}</option>`).join('');
           document.getElementById('ib-sheet-wrap').style.display = 'flex';
         } else {
           document.getElementById('ib-sheet-wrap').style.display = 'none';
@@ -143,67 +144,182 @@ function readFile(file) {
   reader.readAsArrayBuffer(file);
 }
 
-// Some manual/legacy exports put a free-text title row above the real
-// header (e.g. "Outbound Pack Online - Daily Report"). Scan the first
-// few rows and pick the one with the most filled cells as the header —
-// a title row typically has only 1, while a real header row has many.
+// Normalize real-life Excel exports without creating a custom importer for one file.
+// This keeps the app universal: the original column meaning stays visible, but messy
+// headers, empty helper columns and Excel serial dates are cleaned before analysis.
+function normalizeHeaderName(name) {
+  return String(name ?? '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeCellValue(v) {
+  if (v == null) return '';
+  if (typeof v === 'string') return v.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return v;
+}
+
+function isBlankCell(v) {
+  return v == null || String(v).replace(/\s+/g, '').trim() === '';
+}
+
+function isTechnicalEmptyHeader(name) {
+  const n = normalizeHeaderName(name);
+  return !n || /^(__EMPTY|None|null|undefined|Column\s*\d*)$/i.test(n);
+}
+
+function uniqueHeaderName(base, used) {
+  let name = base;
+  let i = 2;
+  while (used.has(name)) name = `${base} (${i++})`;
+  used.add(name);
+  return name;
+}
+
+// Some exports have title rows above the real header. Scan the first rows and
+// prefer the one that looks most like a header, even when the table starts in B.
 function findHeaderRowIndex(ws) {
-  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-  let bestIdx = 0, bestCount = -1;
-  for (let i = 0; i < Math.min(5, rows.length); i++) {
-    const nonEmpty = rows[i].filter(c => c !== '' && c != null).length;
-    if (nonEmpty > bestCount) { bestCount = nonEmpty; bestIdx = i; }
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });
+  let bestIdx = 0, bestScore = -1;
+  for (let i = 0; i < Math.min(12, rows.length); i++) {
+    const cells = (rows[i] || []).map(normalizeHeaderName).filter(v => v && !isTechnicalEmptyHeader(v));
+    if (!cells.length) continue;
+    const filled = cells.length;
+    const textLike = cells.filter(v => /[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]/.test(v)).length;
+    const unique = new Set(cells.map(v => v.toLowerCase())).size;
+    const pivotPenalty = cells.some(v => /^(sum of|suma z|grand total|suma końcowa)$/i.test(v)) ? 2 : 0;
+    const score = filled * 2 + textLike + unique - pivotPenalty;
+    if (score > bestScore) { bestScore = score; bestIdx = i; }
   }
   return bestIdx;
+}
+
+function worksheetToObjects(ws, headerRow) {
+  const rows2d = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });
+  const header = rows2d[headerRow] || [];
+  const used = new Set();
+  const activeCols = [];
+
+  header.forEach((h, idx) => {
+    const name = normalizeHeaderName(h);
+    if (isTechnicalEmptyHeader(name)) return;
+    const hasDataBelow = rows2d.slice(headerRow + 1).some(r => !isBlankCell(r ? r[idx] : ''));
+    if (!hasDataBelow) return;
+    activeCols.push({ idx, name: uniqueHeaderName(name, used) });
+  });
+
+  return rows2d.slice(headerRow + 1).map(r => {
+    const out = {};
+    activeCols.forEach(c => out[c.name] = normalizeCellValue(r ? r[c.idx] : ''));
+    return out;
+  }).filter(row => Object.values(row).some(v => !isBlankCell(v)));
+}
+
+function excelSerialToIso(serial) {
+  const n = Number(serial);
+  if (!isFinite(n) || n <= 25569 || n >= 60000) return null;
+  return new Date((n - 25569) * 86400 * 1000).toISOString().slice(0, 10);
+}
+
+function isDateHeader(col) {
+  return /date|data|termin|delivery|rozład|rozlad|on.?site|transport/i.test(String(col));
+}
+
+function parseDateLike(col, value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  const s = String(value ?? '').trim();
+  if (!s) return null;
+  const serial = /^\d{4,6}$/.test(s) ? excelSerialToIso(s) : null;
+  if (serial) return serial;
+
+  const iso = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (iso) {
+    const y = +iso[1], m = +iso[2], d = +iso[3];
+    if (m >= 1 && m <= 12 && d >= 1 && d <= 31) return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+
+  const dm = s.match(/^(\d{1,2})([./-])(\d{1,2})\2(\d{2,4})/);
+  if (dm) {
+    let a = +dm[1], b = +dm[3], y = +dm[4];
+    if (y < 100) y += 2000;
+    let day, month;
+    if (dm[2] === '.') { day = a; month = b; }
+    else if (b > 12) { month = a; day = b; }   // 2/23/2026
+    else if (a > 12) { day = a; month = b; }
+    else { month = a; day = b; }               // slash ambiguity: keep Excel/US style
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return `${y}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+  }
+  return null;
+}
+
+function normalizeDateColumns(raw) {
+  if (!raw.length) return;
+  Object.keys(raw[0]).forEach(c => {
+    const vals = raw.map(r => r[c]).filter(v => !isBlankCell(v));
+    if (!vals.length) return;
+    const parsed = vals.map(v => parseDateLike(c, v)).filter(Boolean);
+    const shouldConvert = isDateHeader(c) ? parsed.length / vals.length >= 0.35 : parsed.length / vals.length >= 0.8;
+    if (!shouldConvert) return;
+    raw.forEach(r => {
+      const iso = parseDateLike(c, r[c]);
+      if (iso) r[c] = iso;
+    });
+  });
+}
+
+function looksLikePivotSheet(rows, headers) {
+  const headerText = headers.join(' | ');
+  const sampleText = rows.slice(0, 25).map(r => Object.values(r).join(' | ')).join(' | ');
+  return /(sum of|suma z|grand total|suma końcowa|row labels|column labels|etykiety wierszy|etykiety kolumn)/i.test(headerText + ' | ' + sampleText);
+}
+
+function analyzeWorksheetProfile(ws, sheetName) {
+  const headerRow = findHeaderRowIndex(ws);
+  const rows = worksheetToObjects(ws, headerRow);
+  const headers = rows.length ? Object.keys(rows[0]) : [];
+  const pivotLike = looksLikePivotSheet(rows, headers);
+  return { sheetName, headerRow, rows: rows.length, cols: headers.length, pivotLike };
+}
+
+function sheetOptionLabel(name, profile) {
+  if (!profile) return name;
+  const kind = profile.pivotLike ? '📊 Pivot' : '📄 Dane';
+  return `${kind} · ${name} (${profile.rows}×${profile.cols})`;
+}
+
+function updateSheetProfileBanner(profile) {
+  let banner = document.getElementById('sheet-profile-banner');
+  const infoBar = document.querySelector('.info-bar');
+  if (!banner && infoBar) {
+    banner = document.createElement('div');
+    banner.id = 'sheet-profile-banner';
+    infoBar.appendChild(banner);
+  }
+  if (!banner || !profile) return;
+  banner.style.cssText = 'font-size:12px;border-radius:6px;padding:4px 10px;border:1px solid var(--line);color:var(--ink-dim);background:var(--panel-2);';
+  if (profile.pivotLike) {
+    banner.style.borderColor = 'rgba(232,162,61,.45)';
+    banner.style.color = 'var(--amber)';
+    banner.textContent = '📊 Arkusz wygląda jak tabela przestawna Excel — najlepiej analizować dane źródłowe.';
+  } else {
+    banner.textContent = `📄 Dane źródłowe: ${profile.rows} wierszy · ${profile.cols} kolumn`;
+  }
 }
 
 function loadSheet(idx) {
   currentSheetName = sheetNames[idx] || '';
   const ws = workbook.Sheets[currentSheetName];
-  const headerRow = findHeaderRowIndex(ws);
-  const rawUntrimmed = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false, range: headerRow })
-    .filter(row => Object.values(row).some(v => v !== '' && v != null));
-  if (!rawUntrimmed.length) { alert('Sheet is empty'); return; }
+  const profile = (window.__sheetProfiles || [])[Number(idx)] || analyzeWorksheetProfile(ws, currentSheetName);
+  updateSheetProfileBanner(profile);
+  const headerRow = profile.headerRow != null ? profile.headerRow : findHeaderRowIndex(ws);
+  const raw = worksheetToObjects(ws, headerRow);
+  if (!raw.length) { alert('Sheet is empty'); return; }
 
-  // Trim header names and string values. Manual exports very often carry
-  // stray leading/trailing spaces (copy-paste, merged-cell artifacts) which
-  // would otherwise silently split one real value into two categories
-  // (e.g. "H&M" and "H&M " counted as different brands).
-  const raw = rawUntrimmed.map(row => {
-    const out = {};
-    Object.keys(row).forEach(k => {
-      const key = String(k).trim();
-      let val = row[k];
-      if (typeof val === 'string') val = val.trim();
-      out[key] = val;
-    });
-    return out;
-  });
+  normalizeDateColumns(raw);
 
   allData = raw;
   cols = Object.keys(raw[0]);
-
-  // SAP sometimes exports dates as raw Excel serial numbers (e.g. 46054)
-  // with no date format applied to the cell, so they come through as plain
-  // numbers. If a column's name hints at a date and its values look like
-  // plausible serials, convert them to ISO date strings in place so the
-  // normal type detection / date-trend / shift logic picks them up.
-  cols.forEach(c => {
-    if (!/date|data\b/i.test(c)) return;
-    const vals = raw.map(r => r[c]).filter(v => v !== '');
-    if (!vals.length) return;
-    const looksLikeSerial = vals.filter(v => /^\d{4,6}$/.test(String(v).trim())).length / vals.length > 0.8;
-    if (!looksLikeSerial) return;
-    raw.forEach(r => {
-      const v = String(r[c]).trim();
-      if (/^\d{4,6}$/.test(v)) {
-        const serial = parseFloat(v);
-        if (serial > 25569 && serial < 60000) {
-          r[c] = new Date((serial - 25569) * 86400 * 1000).toISOString().slice(0, 10);
-        }
-      }
-    });
-  });
 
   colTypes = {};
   cols.forEach(c => colTypes[c] = detectType(c, raw));
@@ -232,11 +348,20 @@ function loadSheet(idx) {
 function detectType(col, data) {
   const vals = data.map(r => r[col]).filter(v => v !== '' && v != null);
   if (!vals.length) return 'unknown';
+
+  const dateC = vals.filter(v => !!parseDateLike(col, v)).length;
+  if ((isDateHeader(col) && dateC / vals.length > 0.35) || dateC / vals.length > 0.8) return 'date';
+
+  const identifierName = /(^|\b)(id|nr|numer|number|order|ord|req|sku|article|product.?number|wz|contract|kod|code)(\b|$)/i.test(String(col));
+  const identifierVals = vals.filter(v => {
+    const s = String(v).trim();
+    return /[A-Za-z]/.test(s) && /\d/.test(s) && s.length <= 40;
+  }).length;
+  if (identifierName && identifierVals / vals.length > 0.45) return 'identifier';
+
   const numC = vals.filter(v => toNum(v) !== null).length;
   if (numC / vals.length > 0.75) return 'numeric';
-  const datePatterns = [/^\d{4}-\d{2}-\d{2}/, /^\d{2}[./-]\d{2}[./-]\d{4}/, /^\d{2}[./-]\d{2}[./-]\d{2}$/];
-  const dateC = vals.filter(v => datePatterns.some(p => p.test(String(v).trim()))).length;
-  if (dateC / vals.length > 0.5) return 'date';
+
   const uniq = new Set(vals.map(v => String(v))).size;
   if (uniq <= Math.min(30, vals.length * 0.55)) return 'categorical';
   return 'text';
@@ -624,8 +749,8 @@ function renderAnswerCard(a, b) {
 }
 
 function renderBadges() {
-  const map = { numeric:'badge-num', categorical:'badge-cat', date:'badge-date', time:'badge-date', text:'badge-txt', unknown:'badge-txt' };
-  const icons = { numeric:'#', categorical:'≡', date:'📅', time:'🕐', text:'Aa', unknown:'?' };
+  const map = { numeric:'badge-num', categorical:'badge-cat', date:'badge-date', time:'badge-date', identifier:'badge-txt', text:'badge-txt', unknown:'badge-txt' };
+  const icons = { numeric:'#', categorical:'≡', date:'📅', time:'🕐', identifier:'🆔', text:'Aa', unknown:'?' };
   document.getElementById('col-badges').innerHTML = cols.map(c =>
     `<span class="badge ${map[colTypes[c]]}" title="${colTypes[c]}">${icons[colTypes[c]]} ${c}</span>`
   ).join('');
@@ -1233,7 +1358,7 @@ let pivotState = { filters: [], columns: [], rows: [], values: [] };
 function renderPivotFieldList() {
   const host = document.getElementById('pivot-field-list');
   if (!host) return;
-  const icon = { numeric: '🔢', categorical: '🏷️', date: '📅', time: '🕐', text: '🔤' };
+  const icon = { numeric: '🔢', categorical: '🏷️', date: '📅', time: '🕐', identifier: '🆔', text: '🔤' };
   host.innerHTML = cols.map(c => `
     <div class="field-chip" draggable="true" data-col="${escAttr(c)}" ondragstart="onFieldDragStart(event)">
       <span>${icon[colTypes[c]] || '❔'}</span><span>${escAttr(c)}</span>
