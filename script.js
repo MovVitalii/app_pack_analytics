@@ -143,23 +143,16 @@ function readFile(file) {
   reader.readAsArrayBuffer(file);
 }
 
-// Some manual/legacy exports put blank/title rows or small pivot summaries
-// above the real header. Pick the row that looks most like a header: many
-// filled cells help, but header-like words and text labels matter more than
-// raw numeric totals. This keeps normal sheets stable and improves multi-sheet
-// files with summary tabs.
+// Some manual/legacy exports put a free-text title row above the real
+// header (e.g. "Outbound Pack Online - Daily Report"). Scan the first
+// few rows and pick the one with the most filled cells as the header —
+// a title row typically has only 1, while a real header row has many.
 function findHeaderRowIndex(ws) {
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-  const headerWord = /article|brand|qty|quantity|ordered|amount|delivery|date|ord|req|number|supplier|palet|pallet|wz|status|problem|typ|kod|godzina|czas|stanowisko|numer|adres|przewoźnik|przewoznik|opakowań|opakowan|rozładunku|rozladunku|pozosta/i;
-  let bestIdx = 0, bestScore = -Infinity;
-  for (let i = 0; i < Math.min(10, rows.length); i++) {
-    const cells = rows[i].filter(c => c !== '' && c != null);
-    if (!cells.length) continue;
-    const textCount = cells.filter(c => isNaN(Number(String(c).replace(/\s/g, '').replace(',', '.')))).length;
-    const keywordCount = cells.filter(c => headerWord.test(String(c))).length;
-    const numericCount = cells.length - textCount;
-    const score = cells.length + keywordCount * 4 + textCount * 0.8 - numericCount * 0.4 - i * 0.05;
-    if (score > bestScore) { bestScore = score; bestIdx = i; }
+  let bestIdx = 0, bestCount = -1;
+  for (let i = 0; i < Math.min(5, rows.length); i++) {
+    const nonEmpty = rows[i].filter(c => c !== '' && c != null).length;
+    if (nonEmpty > bestCount) { bestCount = nonEmpty; bestIdx = i; }
   }
   return bestIdx;
 }
@@ -179,7 +172,7 @@ function loadSheet(idx) {
   const raw = rawUntrimmed.map(row => {
     const out = {};
     Object.keys(row).forEach(k => {
-      const key = String(k).replace(/\s+/g, ' ').trim();
+      const key = String(k).trim();
       let val = row[k];
       if (typeof val === 'string') val = val.trim();
       out[key] = val;
@@ -239,19 +232,11 @@ function loadSheet(idx) {
 function detectType(col, data) {
   const vals = data.map(r => r[col]).filter(v => v !== '' && v != null);
   if (!vals.length) return 'unknown';
-  const datePatterns = [
-    /^\d{4}-\d{1,2}-\d{1,2}/,
-    /^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$/
-  ];
-  const dateC = vals.filter(v => {
-    if (v instanceof Date) return true;
-    const s = String(v).trim();
-    return datePatterns.some(p => p.test(s)) && !isNaN(Date.parse(s.replace(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/, '$2/$1/$3')));
-  }).length;
-  if (/date|data|dostaw|delivery|transport|site/i.test(col) && dateC / vals.length > 0.35) return 'date';
-  if (dateC / vals.length > 0.6) return 'date';
   const numC = vals.filter(v => toNum(v) !== null).length;
   if (numC / vals.length > 0.75) return 'numeric';
+  const datePatterns = [/^\d{4}-\d{2}-\d{2}/, /^\d{2}[./-]\d{2}[./-]\d{4}/, /^\d{2}[./-]\d{2}[./-]\d{2}$/];
+  const dateC = vals.filter(v => datePatterns.some(p => p.test(String(v).trim()))).length;
+  if (dateC / vals.length > 0.5) return 'date';
   const uniq = new Set(vals.map(v => String(v))).size;
   if (uniq <= Math.min(30, vals.length * 0.55)) return 'categorical';
   return 'text';
@@ -1397,6 +1382,25 @@ function renderExcelPivot() {
   const MAX_ROWS = 500, MAX_COLS = 12;
   let rowVals = [...rowSet];
   let colVals = [...colSet];
+
+  const cellHasValue = (rv, cv) => {
+    const cell = rawByCell[rv + '||' + cv];
+    if (!cell) return false;
+    return values.some(v => (cell[v.col] || []).length > 0);
+  };
+
+  // Keep one shared, cleaned set of pivot rows/columns for both <thead> and <tbody>.
+  // Without this, the header can render generated columns that have no body values
+  // (visible as repeated labels like "LICZBA DOSTAW" after the real table ends).
+  rowVals = rowVals.filter(rv => colVals.some(cv => cellHasValue(rv, cv)));
+  colVals = colVals.filter(cv => rowVals.some(rv => cellHasValue(rv, cv)));
+
+  if (!rowVals.length || (!colVals.length && colCol)) {
+    tableHost.innerHTML = '<div class="empty">Brak danych dla wybranego układu tabeli przestawnej.</div>';
+    chartWrap.style.display = 'none';
+    return;
+  }
+
   // sort rows by total of first value field, descending
   const rowTotal = {};
   rowVals.forEach(rv => {
@@ -1410,18 +1414,28 @@ function renderExcelPivot() {
   const truncatedCols = colVals.length > MAX_COLS;
   if (truncatedCols) colVals = colVals.slice(0, MAX_COLS);
 
-  // build header: for each colVal, one sub-column per value-field (Excel does this when >1 value field)
+  // build header from the exact same subCols list that body uses
   const subCols = colVals.length ? colVals : ['__all__'];
-  const headerRow2 = subCols.map(cv => values.map(v => `${AGG_SHORT[v.agg]} ${escAttr(v.agg === 'count' ? getRowEntityLabel() : v.col)}`).join('</th><th style="padding:6px 10px;text-align:right;font-size:10.5px;color:var(--ink-dim);border-bottom:1px solid var(--line);">')).join('</th><th style="padding:6px 10px;text-align:right;font-size:10.5px;color:var(--ink-dim);border-bottom:1px solid var(--line);border-left:2px solid var(--line);">');
+  const valueLabel = v => `${AGG_SHORT[v.agg]} ${escAttr(v.agg === 'count' ? getRowEntityLabel() : v.col)}`;
+  const singleValue = values.length === 1;
 
   let html = `<table style="width:100%;border-collapse:collapse;font-size:12.5px;">
-    <thead>
-      <tr>
+    <thead>`;
+
+  if (singleValue) {
+    html += `<tr>
+        <th style="position:sticky;left:0;top:0;background:var(--panel-2);padding:8px 10px;text-align:left;border-bottom:1px solid var(--line);z-index:3;">${escAttr(rowCol || '')}</th>
+        ${subCols.map((cv, ci) => `<th style="padding:8px 10px;text-align:right;background:var(--panel-2);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2;${ci > 0 ? 'border-left:2px solid var(--line);' : ''}">${colCol ? escAttr(cv) : valueLabel(values[0])}</th>`).join('')}
+      </tr>`;
+  } else {
+    html += `<tr>
         <th rowspan="2" style="position:sticky;left:0;top:0;background:var(--panel-2);padding:8px 10px;text-align:left;border-bottom:1px solid var(--line);z-index:3;">${escAttr(rowCol || '')}</th>
-        ${subCols.map(cv => `<th colspan="${values.length}" style="padding:6px 10px;text-align:center;background:var(--panel-2);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2;border-left:2px solid var(--line);">${colCol ? escAttr(cv) : 'Wartość'}</th>`).join('')}
+        ${subCols.map((cv, ci) => `<th colspan="${values.length}" style="padding:6px 10px;text-align:center;background:var(--panel-2);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2;${ci > 0 ? 'border-left:2px solid var(--line);' : ''}">${colCol ? escAttr(cv) : 'Wartość'}</th>`).join('')}
       </tr>
-      <tr>${subCols.map(() => values.map(v => `<th style="padding:6px 10px;text-align:right;font-size:10.5px;color:var(--ink-dim);border-bottom:1px solid var(--line);position:sticky;top:26px;background:var(--panel-2);z-index:2;">${AGG_SHORT[v.agg]} ${escAttr(v.agg === 'count' ? getRowEntityLabel() : v.col)}</th>`).join('')).join('<th style="border-left:2px solid var(--line);width:0;padding:0;"></th>')}</tr>
-    </thead>
+      <tr>${subCols.map((cv, ci) => values.map((v, vi) => `<th style="padding:6px 10px;text-align:right;font-size:10.5px;color:var(--ink-dim);border-bottom:1px solid var(--line);position:sticky;top:26px;background:var(--panel-2);z-index:2;${ci > 0 && vi === 0 ? 'border-left:2px solid var(--line);' : ''}">${valueLabel(v)}</th>`).join('')).join('')}</tr>`;
+  }
+
+  html += `</thead>
     <tbody>`;
 
   rowVals.forEach(rv => {
